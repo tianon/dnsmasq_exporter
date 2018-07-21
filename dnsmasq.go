@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"golang.org/x/sync/errgroup"
 
@@ -87,6 +88,18 @@ var (
 		Name: "dnsmasq_leases",
 		Help: "Number of DHCP leases handed out",
 	})
+	leaseExpiry = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dnsmasq_lease_expiry",
+			Help: "Time of lease expiry, in epoch time (seconds since 1970)",
+		},
+		[]string{
+			"mac_address",
+			"ip_address",
+			"computer_name",
+			"client_id",
+		},
+	)
 )
 
 func init() {
@@ -94,6 +107,7 @@ func init() {
 		prometheus.MustRegister(g)
 	}
 	prometheus.MustRegister(leases)
+	prometheus.MustRegister(leaseExpiry)
 }
 
 // From https://manpages.debian.org/stretch/dnsmasq-base/dnsmasq.8.en.html:
@@ -169,8 +183,36 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 		defer f.Close()
 		scanner := bufio.NewScanner(f)
 		var lines float64
+		leaseExpiry.Reset()
 		for scanner.Scan() {
 			lines++
+
+			// http://lists.thekelleys.org.uk/pipermail/dnsmasq-discuss/2016q2/010595.html
+			// http://thekelleys.org.uk/gitweb/?p=dnsmasq.git;a=blob;f=src/lease.c;hb=v2.79#l243
+			// https://serverfault.com/a/786141/58240
+			// https://github.com/Illizian/dnsmasq-leases
+			parts := strings.Fields(scanner.Text())
+			if parts[0] == "duid" {
+				// TODO DHCPv6 support (once we hit "duid", all following records are DHCPv6 in a slightly different format)
+				// duid SERVER-DUID\n
+				// EXPIRY IAID IPv6 HOST CLIENT-DUID
+				// ...
+				break
+			}
+			if len(parts) < 5 {
+				// TODO decide what to do for malformed/incomplete records
+				continue
+			}
+			expiry, err := strconv.ParseFloat(parts[0], 64)
+			if err != nil {
+				expiry = -1
+			}
+			leaseExpiry.With(prometheus.Labels{
+				"mac_address":   parts[1],
+				"ip_address":    parts[2],
+				"computer_name": parts[3],
+				"client_id":     parts[4],
+			}).Set(expiry)
 		}
 		if err := scanner.Err(); err != nil {
 			return err
